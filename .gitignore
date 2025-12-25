@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.py[cod]
+*.env
+*.sqlite3
+
+# Virtual Environment
+tgenv/
+venv/
+env/
+ENV/
+
+# Logs
+*.log
+logs/
+*.out
+
+# Downloads
+downloads/
+cache/
+
+# OS-specific
+.DS_Store
+Thumbs.db
