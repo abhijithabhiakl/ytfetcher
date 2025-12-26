@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 
 import os
-import subprocess
+import asyncio
+import signal
 import logging
 from pathlib import Path
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     ApplicationBuilder,
     MessageHandler,
@@ -15,7 +21,6 @@ from telegram.ext import (
     filters,
 )
 from telegram.request import HTTPXRequest
-import shutil
 
 # ─────────────────────────────────────────────
 # ENV
@@ -24,19 +29,16 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BOT_API_URL = os.getenv("BOT_API_URL")
-ALLOWED_USERS = os.getenv("ALLOWED_USERS", "")
-DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "downloads"))
+BASE_DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "downloads"))
 COOKIES_FILE = os.getenv("COOKIES_FILE")
-MAX_HEIGHT = os.getenv("MAX_HEIGHT", "720")
 PARALLEL = os.getenv("PARALLEL_DOWNLOADS", "4")
-MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "1900"))
 AUTO_CLEANUP = os.getenv("AUTO_CLEANUP", "true").lower() == "true"
-LOG_DIR = os.getenv("LOG_DIR", "/home/hexcats/logs/tgbotlogs")
+LOG_DIR = Path(os.getenv("LOG_DIR", "/home/hexcats/logs/tgbotlogs"))
 
-DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+PYTHON = "/home/hexcats/configs/tgbots/tgenv/bin/python"
 
-ALLOWED_USERS = list(map(int, ALLOWED_USERS.split(","))) if ALLOWED_USERS else None
+BASE_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # ─────────────────────────────────────────────
 # LOGGING
@@ -45,7 +47,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(f"{LOG_DIR}/ytbot.log"),
+        logging.FileHandler(LOG_DIR / "ytbot.log"),
         logging.StreamHandler(),
     ],
 )
@@ -68,53 +70,154 @@ app = (
 )
 
 # ─────────────────────────────────────────────
-# STATE
+# STATE (per user)
 # ─────────────────────────────────────────────
 user_links = {}
-user_send_mode = {}   # "video" or "doc"
-
-PYTHON = "/home/hexcats/configs/tgbots/tgenv/bin/python"
+user_send_mode = {}
+user_max_height = {}
+user_delivery_mode = {}
+running_tasks = {}
 
 # ─────────────────────────────────────────────
-# MESSAGE HANDLER
+# /start
 # ─────────────────────────────────────────────
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🎬 *YouTube Downloader Bot*\n\n"
+        "• Videos & playlists\n"
+        "• MP4 / MP3 / Best\n"
+        "• Save to server or send to Telegram\n"
+        "• /cancel anytime\n\n"
+        "Just send a YouTube link.",
+        parse_mode="Markdown",
+    )
+
+# ─────────────────────────────────────────────
+# /cancel
+# ─────────────────────────────────────────────
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    text = update.message.text.strip()
+    proc = running_tasks.get(user_id)
 
-    if ALLOWED_USERS and user_id not in ALLOWED_USERS:
+    if not proc:
+        await update.message.reply_text("❌ No active download")
         return
 
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+    running_tasks.pop(user_id, None)
+    await update.message.reply_text("🛑 Download cancelled")
+
+# ─────────────────────────────────────────────
+# MESSAGE: LINK
+# ─────────────────────────────────────────────
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    user_id = update.effective_user.id
+
     if "youtube.com" not in text and "youtu.be" not in text:
-        await update.message.reply_text("❌ Send a valid YouTube URL")
+        await update.message.reply_text("❌ Send a valid YouTube link")
         return
 
     user_links[user_id] = text
 
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📤 Send to Telegram", callback_data="deliver_send"),
+            InlineKeyboardButton("💾 Save to Server", callback_data="deliver_save"),
+        ]
+    ])
+
     await update.message.reply_text(
-        "How should I send the file?\n\n"
-        "/video → send as playable video\n"
-        "/doc → send as document"
+        "What should I do after downloading?",
+        reply_markup=keyboard,
     )
 
 # ─────────────────────────────────────────────
-# COMMANDS
+# DELIVERY MODE
+# ─────────────────────────────────────────────
+async def handle_delivery_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    user_delivery_mode[user_id] = query.data.replace("deliver_", "")
+
+    await query.edit_message_text(
+        "How should I send the file?\n\n"
+        "/video → playable video\n"
+        "/doc → document"
+    )
+
+# ─────────────────────────────────────────────
+# SEND MODE
 # ─────────────────────────────────────────────
 async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_send_mode[update.effective_user.id] = "video"
-    await show_format_buttons(update)
+    await ask_quality(update)
 
 async def cmd_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_send_mode[update.effective_user.id] = "doc"
-    await show_format_buttons(update)
+    await ask_quality(update)
 
-async def show_format_buttons(update: Update):
+async def ask_quality(update: Update):
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎥 MP4", callback_data="mp4"),
-         InlineKeyboardButton("🎧 MP3", callback_data="mp3")],
-        [InlineKeyboardButton("🎬 Best", callback_data="best")],
+        [
+            InlineKeyboardButton("360p", callback_data="q_360"),
+            InlineKeyboardButton("720p", callback_data="q_720"),
+            InlineKeyboardButton("1080p", callback_data="q_1080"),
+        ]
     ])
-    await update.message.reply_text("Select format:", reply_markup=keyboard)
+    await update.message.reply_text("Select max quality:", reply_markup=keyboard)
+
+# ─────────────────────────────────────────────
+# FORMAT BUTTONS
+# ─────────────────────────────────────────────
+async def show_format_buttons(query):
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🎥 MP4", callback_data="mp4"),
+            InlineKeyboardButton("🎧 MP3", callback_data="mp3"),
+        ],
+        [InlineKeyboardButton("⭐ Best", callback_data="best")],
+    ])
+    await query.edit_message_text("Select format:", reply_markup=keyboard)
+
+# ─────────────────────────────────────────────
+# DOWNLOAD WORKER
+# ─────────────────────────────────────────────
+async def run_download(process, user_id, query, user_dir, send_mode, delivery):
+    await process.wait()
+
+    files = [f for f in user_dir.rglob("*") if f.is_file()]
+
+    for file_path in files:
+        logging.info("USER %s downloaded %s", user_id, file_path)
+
+        if delivery == "send":
+            with open(file_path, "rb") as f:
+                if send_mode == "video" and file_path.suffix == ".mp4":
+                    await query.message.reply_video(f, supports_streaming=True)
+                else:
+                    await query.message.reply_document(f)
+
+        if AUTO_CLEANUP:
+            file_path.unlink(missing_ok=True)
+
+    if AUTO_CLEANUP:
+        try:
+            user_dir.rmdir()
+        except OSError:
+            pass
+
+    running_tasks.pop(user_id, None)
+    user_links.pop(user_id, None)
+    user_send_mode.pop(user_id, None)
+    user_delivery_mode.pop(user_id, None)
+    user_max_height.pop(user_id, None)
 
 # ─────────────────────────────────────────────
 # BUTTON HANDLER
@@ -122,82 +225,73 @@ async def show_format_buttons(update: Update):
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     user_id = query.from_user.id
-    fmt = query.data
 
-    url = user_links.get(user_id)
-    send_mode = user_send_mode.get(user_id)
-
-    if not url or not send_mode:
-        await query.edit_message_text("❌ Send link again")
+    if query.data.startswith("q_"):
+        user_max_height[user_id] = query.data.split("_")[1]
+        await show_format_buttons(query)
         return
+
+    if user_id not in user_links:
+        await query.edit_message_text("❌ Session expired. Send link again.")
+        return
+
+    url = user_links[user_id]
+    send_mode = user_send_mode[user_id]
+    delivery = user_delivery_mode[user_id]
+    max_h = user_max_height[user_id]
 
     await query.edit_message_text("⬇️ Downloading...")
 
-    if fmt == "mp4":
-        ytdlp_format = f"bv*[ext=mp4][height<={MAX_HEIGHT}]+ba[ext=m4a]/mp4"
+    user_dir = BASE_DOWNLOAD_DIR / str(user_id)
+    user_dir.mkdir(parents=True, exist_ok=True)
+
+    if query.data == "mp4":
+        ytdlp_format = f"bv*[ext=mp4][height<={max_h}]+ba[ext=m4a]/mp4"
         extra = []
-    elif fmt == "mp3":
+    elif query.data == "mp3":
         ytdlp_format = "bestaudio"
-        extra = ["--extract-audio", "--audio-format", "mp3", "--audio-quality", "0"]
+        extra = ["--extract-audio", "--audio-format", "mp3"]
     else:
         ytdlp_format = "best"
         extra = []
 
-    # Temporary folder per user request
-    user_dir = DOWNLOAD_DIR / str(user_id)
-    user_dir.mkdir(parents=True, exist_ok=True)
+    outtmpl = user_dir / "%(playlist_title)s/%(title)s.%(ext)s"
 
     cmd = [
         PYTHON, "-m", "yt_dlp",
         "-N", PARALLEL,
         "-f", ytdlp_format,
-        "-o", str(user_dir / "%(title)s.%(ext)s"),
+        "-o", str(outtmpl),
+        "--yes-playlist",
         *extra,
         url,
     ]
+
     if COOKIES_FILE and os.path.exists(COOKIES_FILE):
         cmd += ["--cookies", COOKIES_FILE]
 
-    try:
-        subprocess.run(cmd, check=True)
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        start_new_session=True
+    )
 
-        files = list(user_dir.glob("*"))
-        files.sort(key=lambda f: f.stat().st_ctime)
+    running_tasks[user_id] = process
 
-        for file_path in files:
-            size_mb = file_path.stat().st_size / (1024 * 1024)
-            if size_mb > MAX_FILE_SIZE_MB:
-                await query.message.reply_text(f"⚠️ Skipping {file_path.name}, file too large")
-                continue
-
-            with open(file_path, "rb") as f:
-                if send_mode == "video" and file_path.suffix == ".mp4":
-                    await query.message.reply_video(video=f, filename=file_path.name, supports_streaming=True)
-                else:
-                    await query.message.reply_document(document=f, filename=file_path.name)
-
-            if AUTO_CLEANUP:
-                file_path.unlink(missing_ok=True)
-
-    except Exception:
-        logging.exception("Download/send failed")
-        await query.message.reply_text("❌ Failed")
-
-    finally:
-        user_links.pop(user_id, None)
-        user_send_mode.pop(user_id, None)
-        if AUTO_CLEANUP:
-            shutil.rmtree(user_dir, ignore_errors=True)
+    asyncio.create_task(
+        run_download(process, user_id, query, user_dir, send_mode, delivery)
+    )
 
 # ─────────────────────────────────────────────
 # HANDLERS
 # ─────────────────────────────────────────────
+app.add_handler(CommandHandler("start", cmd_start))
+app.add_handler(CommandHandler("cancel", cmd_cancel))
 app.add_handler(CommandHandler("video", cmd_video))
 app.add_handler(CommandHandler("doc", cmd_doc))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+app.add_handler(CallbackQueryHandler(handle_delivery_choice, pattern="^deliver_"))
 app.add_handler(CallbackQueryHandler(handle_button))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-logging.info("ytbot started (video/doc + format + playlist support enabled)")
+logging.info("ytbot started — multi-user safe, cancellable")
 app.run_polling()
