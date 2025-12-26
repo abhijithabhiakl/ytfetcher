@@ -12,6 +12,10 @@ tgenv/
 venv/
 env/
 ENV/
+# Environment files
+.env
+.env.*
+!.env.example
 
 # Logs
 *.log
