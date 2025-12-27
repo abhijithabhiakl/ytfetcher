@@ -30,6 +30,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 BOT_API_URL = os.getenv("BOT_API_URL")
 BASE_DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "downloads"))
+BOT_CACHE_PATH = Path(os.getenv("BOT_CACHE_PATH", "cache"))
 COOKIES_FILE = os.getenv("COOKIES_FILE")
 PARALLEL = os.getenv("PARALLEL_DOWNLOADS", "4")
 AUTO_CLEANUP = os.getenv("AUTO_CLEANUP", "true").lower() == "true"
@@ -38,6 +39,7 @@ LOG_DIR = Path(os.getenv("LOG_DIR", "/home/hexcats/logs/tgbotlogs"))
 PYTHON = "/home/hexcats/configs/tgbots/tgenv/bin/python"
 
 BASE_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+BOT_CACHE_PATH.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # ─────────────────────────────────────────────
@@ -51,6 +53,13 @@ logging.basicConfig(
         logging.StreamHandler(),
     ],
 )
+
+download_logger = logging.getLogger('downloads')
+download_logger.setLevel(logging.INFO)
+download_handler = logging.FileHandler(LOG_DIR / "downloads.log")
+download_formatter = logging.Formatter('%(asctime)s | user_id=%(user_id)s | username=%(username)s | mode=%(mode)s | format=%(format)s | max_res=%(max_res)s | file=%(file)s | url=%(url)s', datefmt='%Y-%m-%d %H:%M:%S.%f')
+download_handler.setFormatter(download_formatter)
+download_logger.addHandler(download_handler)
 
 # ─────────────────────────────────────────────
 # TELEGRAM CLIENT
@@ -76,6 +85,7 @@ user_links = {}
 user_send_mode = {}
 user_max_height = {}
 user_delivery_mode = {}
+user_format = {}
 running_tasks = {}
 
 # ─────────────────────────────────────────────
@@ -146,24 +156,21 @@ async def handle_delivery_choice(update: Update, context: ContextTypes.DEFAULT_T
     user_id = query.from_user.id
     user_delivery_mode[user_id] = query.data.replace("deliver_", "")
 
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎥 Media", callback_data="mode_video")],
+        [InlineKeyboardButton("📄 Document", callback_data="mode_doc")],
+    ])
+
     await query.edit_message_text(
-        "How should I send the file?\n\n"
-        "/video → playable video\n"
-        "/doc → document"
+        "How should I send the file?",
+        reply_markup=keyboard,
     )
 
 # ─────────────────────────────────────────────
 # SEND MODE
 # ─────────────────────────────────────────────
-async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_send_mode[update.effective_user.id] = "video"
-    await ask_quality(update)
 
-async def cmd_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_send_mode[update.effective_user.id] = "doc"
-    await ask_quality(update)
-
-async def ask_quality(update: Update):
+async def ask_quality(query):
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("360p", callback_data="q_360"),
@@ -171,7 +178,7 @@ async def ask_quality(update: Update):
             InlineKeyboardButton("1080p", callback_data="q_1080"),
         ]
     ])
-    await update.message.reply_text("Select max quality:", reply_markup=keyboard)
+    await query.edit_message_text("Select max quality:", reply_markup=keyboard)
 
 # ─────────────────────────────────────────────
 # FORMAT BUTTONS
@@ -189,53 +196,7 @@ async def show_format_buttons(query):
 # ─────────────────────────────────────────────
 # DOWNLOAD WORKER
 # ─────────────────────────────────────────────
-async def run_download(process, user_id, query, user_dir, send_mode, delivery):
-    await process.wait()
-
-    files = [f for f in user_dir.rglob("*") if f.is_file()]
-
-    for file_path in files:
-        logging.info("USER %s downloaded %s", user_id, file_path)
-
-        if delivery == "send":
-            with open(file_path, "rb") as f:
-                if send_mode == "video" and file_path.suffix == ".mp4":
-                    await query.message.reply_video(f, supports_streaming=True)
-                else:
-                    await query.message.reply_document(f)
-
-        if AUTO_CLEANUP:
-            file_path.unlink(missing_ok=True)
-
-    if AUTO_CLEANUP:
-        try:
-            user_dir.rmdir()
-        except OSError:
-            pass
-
-    running_tasks.pop(user_id, None)
-    user_links.pop(user_id, None)
-    user_send_mode.pop(user_id, None)
-    user_delivery_mode.pop(user_id, None)
-    user_max_height.pop(user_id, None)
-
-# ─────────────────────────────────────────────
-# BUTTON HANDLER
-# ─────────────────────────────────────────────
-async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-
-    if query.data.startswith("q_"):
-        user_max_height[user_id] = query.data.split("_")[1]
-        await show_format_buttons(query)
-        return
-
-    if user_id not in user_links:
-        await query.edit_message_text("❌ Session expired. Send link again.")
-        return
-
+async def start_download(query, user_id, format):
     url = user_links[user_id]
     send_mode = user_send_mode[user_id]
     delivery = user_delivery_mode[user_id]
@@ -243,13 +204,13 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.edit_message_text("⬇️ Downloading...")
 
-    user_dir = BASE_DOWNLOAD_DIR / str(user_id)
+    user_dir = BOT_CACHE_PATH / str(user_id)
     user_dir.mkdir(parents=True, exist_ok=True)
 
-    if query.data == "mp4":
+    if format == "mp4":
         ytdlp_format = f"bv*[ext=mp4][height<={max_h}]+ba[ext=m4a]/mp4"
         extra = []
-    elif query.data == "mp3":
+    elif format == "mp3":
         ytdlp_format = "bestaudio"
         extra = ["--extract-audio", "--audio-format", "mp3"]
     else:
@@ -279,16 +240,102 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     running_tasks[user_id] = process
 
     asyncio.create_task(
-        run_download(process, user_id, query, user_dir, send_mode, delivery)
+        run_download(process, user_id, query, user_dir, send_mode, delivery, format, url, max_h)
     )
+
+async def run_download(process, user_id, query, user_dir, send_mode, delivery, format, url, max_h):
+    await process.wait()
+
+    files = [f for f in user_dir.rglob("*") if f.is_file()]
+
+    target_dir = BASE_DOWNLOAD_DIR / str(user_id) if delivery == "save" else None
+
+    if delivery == "save":
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for file_path in files:
+            relative = file_path.relative_to(user_dir)
+            target_path = target_dir / relative
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.rename(target_path)
+
+    for file_path in files:
+        logging.info("USER %s downloaded %s", user_id, file_path)
+
+        download_logger.info('', extra={
+            'user_id': user_id,
+            'username': query.from_user.username or 'unknown',
+            'mode': send_mode,
+            'format': format,
+            'max_res': max_h,
+            'file': file_path.name,
+            'url': url
+        })
+
+        if delivery == "send":
+            with open(file_path, "rb") as f:
+                if send_mode == "video" and file_path.suffix == ".mp4":
+                    await query.message.reply_video(f, supports_streaming=True)
+                else:
+                    await query.message.reply_document(f)
+
+        if AUTO_CLEANUP:
+            file_path.unlink(missing_ok=True)
+
+    if delivery == "send":
+        await query.message.reply_text("✅ Download complete! Files sent to Telegram.")
+    else:
+        await query.message.reply_text(f"✅ Download complete! Files saved to server")
+
+    if AUTO_CLEANUP:
+        try:
+            user_dir.rmdir()
+        except OSError:
+            pass
+
+    running_tasks.pop(user_id, None)
+    user_links.pop(user_id, None)
+    user_send_mode.pop(user_id, None)
+    user_delivery_mode.pop(user_id, None)
+    user_max_height.pop(user_id, None)
+    user_format.pop(user_id, None)
+
+# ─────────────────────────────────────────────
+# BUTTON HANDLER
+# ─────────────────────────────────────────────
+async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+    if query.data.startswith("q_"):
+        user_max_height[user_id] = query.data.split("_")[1]
+        format = user_format[user_id]
+        await start_download(query, user_id, format)
+        return
+
+    if query.data.startswith("mode_"):
+        user_send_mode[user_id] = query.data.split("_")[1]
+        await show_format_buttons(query)
+        return
+
+    if query.data in ["mp4", "mp3", "best"]:
+        user_format[user_id] = query.data
+        if query.data == "mp3":
+            user_max_height[user_id] = "1080"  # default
+            await start_download(query, user_id, query.data)
+        else:
+            await ask_quality(query)
+        return
+
+    if user_id not in user_links:
+        await query.edit_message_text("❌ Session expired. Send link again.")
+        return
 
 # ─────────────────────────────────────────────
 # HANDLERS
 # ─────────────────────────────────────────────
 app.add_handler(CommandHandler("start", cmd_start))
 app.add_handler(CommandHandler("cancel", cmd_cancel))
-app.add_handler(CommandHandler("video", cmd_video))
-app.add_handler(CommandHandler("doc", cmd_doc))
 app.add_handler(CallbackQueryHandler(handle_delivery_choice, pattern="^deliver_"))
 app.add_handler(CallbackQueryHandler(handle_button))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
